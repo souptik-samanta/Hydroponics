@@ -1,155 +1,148 @@
 #include <WiFi.h>
-#include <Wire.h>
-#include <Adafruit_SSD1306.h>
-#include <DHT.h>
 #include <WebServer.h>
+#include <DHT.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 
-// ============= PIN DEFINITIONS =============
-// Change these pins according to your wiring
-#define DHTPIN 27        // DHT11 Temperature & Humidity sensor
-#define TDS_PIN 32       // TDS (Total Dissolved Solids) sensor analog input
-#define PH_PIN 34        // pH sensor analog input  
-#define RELAY_PIN 4      // Water pump relay control pin
+// Pin definitions
+#define DHTPIN 27
+#define DHTTYPE DHT22
+#define PUMP_PIN 26
+#define PH_PIN 34
+#define TDS_PIN 32
 
-// ============= DISPLAY SETTINGS =============
+
+
+float TEMPA = 31.0;
+
+const float VREF = 3.3;
+const float ADC_RESOLUTION = 4095.0;
+
+//  FINAL calibration factor to get 150 ppm
+const float TDS_CALIB_FACTOR = 2.857;
+
+
+// Display
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
-// ============= SENSOR INITIALIZATION =============
-#define DHTTYPE DHT11
+// Sensor and state variables
 DHT dht(DHTPIN, DHTTYPE);
+float temp = 0, humidity = 0, phValue = 0, tds = 0;
+bool pumpState = true;
 
-// ============= WIFI INITIALIZATION =============
-
+// Wi-Fi AP mode credentials
 const char* ssid = "ESP32-Hydroponics";
 const char* password = "12345678";
 
 WebServer server(80);
 
-// ADC and calibration constants
-const float ADC_Resolution = 4095.0;
-const float Vref = 3.3;
-const float NeutralVoltage = 1.627; // Calibrated for pH 7.0
-const float TDS_CorrectionFactor = 2.57;     // Multiplier
-const float TEMP_Offset = 29.4;              // Additive
+// Read all sensor values
+void readSensors() {
+    float temp = dht.readTemperature();
+  float humidity = dht.readHumidity();
 
-// Sensor values intially
-float humidity = 0;
-float phValue = 0;
-float tds = 0;
-float temp = 0;
-bool pumpStatus = true;
+  if (isnan(temp) || isnan(humidity)) {
+    Serial.println("Failed to read from DHT sensor!");
+  } else {
+    Serial.printf("Temperature: %.1f C, Humidity: %.1f %%\n", temp, humidity);
+  }  
+
+  int phADC = analogRead(PH_PIN);
+  float phVoltage = (phADC / 4095.0) * 3.3;
+  phValue =9.73 * phVoltage - 11;
+
+
+  int tdsADC = analogRead(TDS_PIN);
+  float tdsVoltage = tdsADC * VREF / ADC_RESOLUTION;
+  float rawTDS = (tdsVoltage * 133.42) / (1 + 0.02 * (TEMPA - 25.0));
+  float tds = rawTDS * TDS_CALIB_FACTOR;
+
+
+  Serial.printf("Temp: %.2f C, Humidity: %.2f %%, pH: %.2f, TDS: %.2f ppm\n", temp, humidity, phValue, tds);
+}
+
+// Update OLED display
+void updateDisplay() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(0, 0);
+  display.printf("Temp: %.1f C\n", temp);
+  display.printf("Hum:  %.1f %%\n", humidity);
+  display.printf("pH:   %.2f\n", phValue);
+  display.printf("TDS:  %.1f ppm\n", tds);
+  display.printf("Pump: %s\n", pumpState ? "ON" : "OFF");
+
+  display.display();
+}
+
+// HTTP GET: return JSON sensor data
+void handleGet() {
+  String json = "{";
+  json += "\"ph\":" + String(phValue, 2) + ",";
+  json += "\"tds\":" + String(tds, 1) + ",";
+  json += "\"temp\":" + String(temp, 1) + ",";
+  json += "\"humidity\":" + String(humidity, 1) + ",";
+  json += "\"pump\":" + String(pumpState ? "true" : "false");
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+// HTTP POST: control pump
+void handlePumpControl() {
+  if (server.hasArg("status")) {
+    String status = server.arg("status");
+    if (status == "on") {
+      digitalWrite(PUMP_PIN, HIGH);
+      pumpState = true;
+      server.send(200, "text/plain", "Pump turned ON");
+    } else if (status == "off") {
+      digitalWrite(PUMP_PIN, LOW);
+      pumpState = false;
+      server.send(200, "text/plain", "Pump turned OFF");
+    } else {
+      server.send(400, "text/plain", "Invalid status");
+    }
+  } else {
+    server.send(400, "text/plain", "Missing 'status' parameter");
+  }
+}
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("Booting...");
-
   dht.begin();
-  pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, HIGH); // ON
-  Serial.println("Pump set to ON");
+  pinMode(PUMP_PIN, OUTPUT);
+  digitalWrite(PUMP_PIN, HIGH);  // Default ON
+  pumpState = true;
 
-  // OLED Init
+  // Start OLED
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println("OLED not found");
-  } else {
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setTextColor(SSD1306_WHITE);
-    display.setCursor(0, 0);
-    display.println("Starting...");
-    display.display();
+    Serial.println(F("OLED init failed"));
+    while (true);
   }
+  display.clearDisplay();
+  display.display();
 
-  // WiFi AP Mode
+  // Set up WiFi Access Point
   WiFi.softAP(ssid, password);
-  Serial.print("AP IP: ");
+  Serial.println("ESP32 in AP mode");
+  Serial.print("IP: ");
   Serial.println(WiFi.softAPIP());
 
-  // API: GET /get
-  server.on("/get", HTTP_GET, []() {
-    String response = "{";
-    response += "\"ph\":" + String(phValue, 2) + ",";
-    response += "\"tds\":" + String(tds, 1) + ",";
-    response += "\"temp\":" + String(temp, 1) + ",";
-    response += "\"humidity\":" + String(humidity, 1) + ",";
-    response += "\"pump\":" + String(pumpStatus ? "true" : "false");
-    response += "}";
-    server.send(200, "application/json", response);
-  });
-
-  // API: POST /pump
-  server.on("/pump", HTTP_POST, []() {
-    if (server.hasArg("status")) {
-      String val = server.arg("status");
-      if (val == "on") {
-        digitalWrite(RELAY_PIN, HIGH);
-        pumpStatus = true;
-      } else {
-        digitalWrite(RELAY_PIN, LOW);
-        pumpStatus = false;
-      }
-      server.send(200, "text/plain", "Pump: " + val);
-    } else {
-      server.send(400, "text/plain", "Missing 'status'");
-    }
-  });
-
+  // Define server routes
+  server.on("/get", HTTP_GET, handleGet);
+  server.on("/pump", HTTP_POST, handlePumpControl);
   server.begin();
-  Serial.println("Server started");
+  Serial.println("Web server started");
 }
 
 void loop() {
   server.handleClient();
-  readSensors();  // Read actual sensor values
+  readSensors();
   updateDisplay();
   delay(3000);
-}
-
-void readSensors() {
-  // Read raw temperature from DHT11 and apply offset
-  float rawTemp = dht.readTemperature();
-  if (!isnan(rawTemp)) {
-    temp = rawTemp + TEMP_Offset;
-  } else {
-    Serial.println("Failed to read temperature from DHT sensor!");
-    temp = 0; // or keep previous value
-  }
-
-  // Read humidity from DHT11
-  humidity = dht.readHumidity();
-  if (isnan(humidity)) {
-    Serial.println("Failed to read humidity from DHT sensor!");
-    humidity = 0; // or keep previous value
-  }
-
-  // Read TDS sensor
-  int tdsRawValue = analogRead(TDS_PIN);
-  float tdsVoltage = tdsRawValue * Vref / ADC_Resolution;
-  float tdsRaw = (tdsVoltage * 133.42) / (1 + 0.02 * (temp - 25.0));
-  tds = tdsRaw * TDS_CorrectionFactor;
-
-  // Read pH sensor
-  int phRawValue = analogRead(PH_PIN);
-  float phVoltage = (phRawValue / ADC_Resolution) * Vref;
-  phValue = 7.0 - ((phVoltage - NeutralVoltage) / 0.0591);
-
-  // Debug output
-  Serial.print("Temperature: "); Serial.print(temp); Serial.println(" °C");
-  Serial.print("Humidity: "); Serial.print(humidity); Serial.println(" %");
-  Serial.print("TDS: "); Serial.print(tds); Serial.println(" ppm");
-  Serial.print("pH: "); Serial.println(phValue, 2);
-  Serial.println("---");
-}
-
-void updateDisplay() {
-  display.clearDisplay();
-  display.setCursor(0, 0);
-  display.print("pH: "); display.println(phValue, 2);
-  display.print("TDS: "); display.println(tds);
-  display.print("Temp: "); display.println(temp);
-  display.print("Humid: "); display.println(humidity);
-  display.print("Pump: "); display.println(pumpStatus ? "ON" : "OFF");
-  display.display();
 }
